@@ -24,7 +24,7 @@ except ImportError as exc:
 
 
 DEFAULT_SEARCH_PATH_FILE = Path(__file__).resolve().parents[2] / "docs" / "search_path.json"
-DEFAULT_CUBE_LOCALISATION_DATASET_DIR = Path(__file__).resolve().parents[2] / "docs" / "Cobe_Localisation_dataset"
+DEFAULT_CUBE_LOCALISATION_DATASET_DIR = Path(__file__).resolve().parents[2] / "docs" / "Cube_Localisation_dataset_tmp"
 
 
 def load_search_path(path: Path | None = None) -> list[list[float]]:
@@ -765,7 +765,7 @@ if __name__ == "__main__":
     CAMERA_PADDING_MAX = 0.2
     JOINT_TOLERANCE_DEG = 0.1
     MAX_CONTROL_STEPS_PER_WAYPOINT = 2000
-    SEARCH_SPEED_MULTIPLIER = 3.0  # 1.0 = baseline, 2.0 = ~2x, 3.0 = ~3x
+    SEARCH_SPEED_MULTIPLIER = 5.0  # 1.0 = baseline, 2.0 = ~2x, 3.0 = ~3x
     TEST_DELAY_SECONDS = 0.1
     MAX_SAMPLES = None  # e.g. 100 for a short run
     STOP_ON_ERROR = False
