@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datasets
+Cobe_Localisation_dataset/

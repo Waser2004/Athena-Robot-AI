@@ -64,6 +64,16 @@ class RobotEnv:
         secondary_arm_obj = self.robot_objects["secondary arm - part 2"]
         world_euler = secondary_arm_obj.matrix_world.to_euler('XYZ')
         print(f"Secondary Arm part 2 world rotation (radians): x={world_euler.x}, y={world_euler.y}, z={world_euler.z}")
+
+    def set_cube_pose(self, x: float, y: float, z: float = 0.025, yaw: float | None = None):
+        """Set target cube pose on the workplate."""
+        self.target_cube.rotation_euler.x = 0
+        self.target_cube.rotation_euler.y = 0
+        self.target_cube.rotation_euler.z = random.uniform(0, 2 * pi) if yaw is None else float(yaw)
+
+        self.target_cube.location.x = float(x)
+        self.target_cube.location.y = float(y)
+        self.target_cube.location.z = float(z)
     
     def reset(self, cube_position: str = "home", robot_pose: str = "home", actuator_rotations: list[float] | None = None):
         """
@@ -101,7 +111,7 @@ class RobotEnv:
             self.robot_objects["secondary arm - part 1"].rotation_euler = Euler((-0.8185838538, 0, 0), 'XYZ')
             self.robot_objects["secondary arm - part 2"].rotation_euler = Euler((0, 0, 0), 'XYZ')
             self.robot_objects["tertiary arm - part 1"].rotation_euler = Euler((2.389373199, 0, 0), 'XYZ')
-            self.robot_objects["tertiary arm - part 2"].rotation_euler = Euler((0, 0, 0), 'XYZ')
+            self.robot_objects["tertiary arm - part 2"].rotation_euler = Euler((0, pi / 2, 0), 'XYZ')
             self.robot_objects["finger - right"].rotation_euler = Euler((0, 0, pi), 'XYZ')
             self.robot_objects["finger - left"].rotation_euler = Euler((0, 0, pi), 'XYZ')
 
@@ -156,6 +166,28 @@ class RobotEnv:
 
         distance = sqrt((center_x - 0.5) ** 2 + (center_y - 0.5) ** 2) / sqrt(2)
         return min(distance, 1.0)
+
+    def target_cube_within_padding(self, padding: float = 0.1) -> bool:
+        """
+        Returns True if the full projected cube bbox is inside [padding, 1-padding]
+        in both x and y camera coordinates.
+        """
+        bpy.context.view_layer.update()  # Force update of transforms
+        scene = bpy.context.scene
+        mesh = self.target_cube.data
+        world_matrix = self.target_cube.matrix_world
+
+        for vertex in mesh.vertices:
+            world_coord = world_matrix @ vertex.co
+            co_ndc = world_to_camera_view(scene, self.camera, world_coord)
+
+            if (0.0 + padding <= co_ndc.x <= 1.0 - padding and
+                0.0 + padding <= co_ndc.y <= 1.0 - padding and
+                co_ndc.z > 0):
+
+                return True
+        
+        return False
 
     def get_state(
             self, 
@@ -507,9 +539,30 @@ class RLServerModalOperator(bpy.types.Operator):
                                 send_response(self._client_conn, {"result": result})
                                 print(f'checked if target cube is in view: {result}')
 
+                            if request["function"] == "target_cube_within_padding":
+                                result = env.target_cube_within_padding(request["args"].get("padding", 0.1))
+                                send_response(self._client_conn, {"result": result})
+                                print(
+                                    "checked padded cube visibility: "
+                                    f"padding={request['args'].get('padding', 0.1)} result={result}"
+                                )
+
                             if request["function"] == "set_robot_pose":
                                 env.set_robot_pose(request["args"]["actuator_rotations"])
                                 print(f'set robot pose to {request["args"]["actuator_rotations"]}')
+
+                            if request["function"] == "set_cube_pose":
+                                env.set_cube_pose(
+                                    request["args"]["x"],
+                                    request["args"]["y"],
+                                    request["args"].get("z", 0.025),
+                                    request["args"].get("yaw"),
+                                )
+                                print(
+                                    "set cube pose to "
+                                    f"x={request['args']['x']}, y={request['args']['y']}, "
+                                    f"z={request['args'].get('z', 0.025)}, yaw={request['args'].get('yaw')}"
+                                )
                 
                 except BlockingIOError:
                     pass  # No data yet
@@ -531,7 +584,14 @@ class RLServerModalOperator(bpy.types.Operator):
         print("RL Env Server started (modal timer)")
 
         wm = context.window_manager
-        self._timer = wm.event_timer_add(0.1, window=context.window)
+        tick_rate_multiplier = 3.0
+        effective_tick_hz = max(getattr(env, "fps", 30), 1) * tick_rate_multiplier
+        timer_interval_s = 1.0 / effective_tick_hz
+        self._timer = wm.event_timer_add(timer_interval_s, window=context.window)
+        print(
+            "RL Env Server timer interval set to "
+            f"{timer_interval_s:.4f}s (effective {effective_tick_hz:.1f} Hz)"
+        )
         wm.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
