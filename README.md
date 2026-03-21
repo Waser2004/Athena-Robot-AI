@@ -10,7 +10,7 @@ This repository provides the data generation and model training scripts for
 New PyTorch scaffold scripts are available in `src/cube_localisation`:
 
 - `dataset.py`: PNG loading + filename label parsing + spatial train/val/test split by random workplate region.
-- `model.py`: pretrained backbone factory (`resnet18` default) with regression head.
+- `model.py`: pretrained backbone factory (`resnet34` default) with regression head.
 - `train.py`: finetuning script with TensorBoard logging and checkpointing.
 - `evaluate.py`: validation/test evaluation script using the same spatial split logic.
 

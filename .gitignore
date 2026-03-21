@@ -8,3 +8,6 @@ Cube_Localisation_dataset_tmp/
 
 # Logs and checkpoints
 runs/
+
+# blender backups
+*.blend1

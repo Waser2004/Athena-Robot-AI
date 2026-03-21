@@ -108,16 +108,35 @@ def main() -> None:
         pretrained=False,
         joint_input_dim=joint_input_dim,
         joint_hidden_dim=joint_hidden_dim,
+        joint_mean=joint_mean,
+        joint_std=joint_std,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     loss_fn = nn.MSELoss()
-    loss, mae_m, mae_dim_m = run_epoch_eval(model, loader, loss_fn, device, target_mean=target_mean, target_std=target_std)
+    eval_summary = run_epoch_eval(
+        model,
+        loader,
+        loss_fn,
+        device,
+        target_mean=target_mean,
+        target_std=target_std,
+        target_keys=target_keys,
+        collect_samples=False,
+    )
+    loss = eval_summary.loss
+    mae_m = eval_summary.mae_m
+    mae_dim_m = eval_summary.mae_dim_m
 
     print(f"split={args.split} samples={len(indices)}")
     print(f"loss={loss:.6f}")
     print(f"mae_m={mae_m:.6f}")
     print(f"mae_cm={mae_m * 100.0:.3f}")
+    if eval_summary.mean_distance_offset_m is not None:
+        print(f"mean_distance_offset_m={eval_summary.mean_distance_offset_m:.6f}")
+        print(f"mean_distance_offset_cm={eval_summary.mean_distance_offset_m * 100.0:.3f}")
+    if eval_summary.mean_rotation_offset_deg is not None:
+        print(f"mean_rotation_offset_deg={eval_summary.mean_rotation_offset_deg:.3f}")
     for idx, key in enumerate(target_keys):
         print(f"mae_{key}_m={mae_dim_m[idx]:.6f}")
         print(f"mae_{key}_cm={mae_dim_m[idx] * 100.0:.3f}")

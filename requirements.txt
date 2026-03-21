@@ -3,3 +3,4 @@ torchvision>=0.17
 tensorboard>=2.15
 numpy>=1.26
 Pillow>=10.0
+matplotlib>=3.8

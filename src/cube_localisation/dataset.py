@@ -641,7 +641,7 @@ if __name__ == "__main__":
     dataset_dir = resolve_dataset_dir()
     records = load_records(dataset_dir)
     split_config = SpatialSplitConfig(
-        seed=42,
+        seed=None,
         val_region_ratio=0.25,
         test_region_ratio=0.25,
         ensure_non_overlapping_regions=True,

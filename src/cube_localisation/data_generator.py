@@ -459,7 +459,14 @@ class DataGenerator:
         self._ensure_grapper_open()
 
         for waypoint_index, waypoint_deg in enumerate(self.search_path):
-            target_rotations_rad = [radians(float(value)) for value in waypoint_deg]
+            if len(waypoint_deg) != 6:
+                raise ValueError(f"Expected 6 joint values per waypoint, got {len(waypoint_deg)} at index {waypoint_index}")
+
+            waypoint_with_offset_deg = [
+                float(value) + random.uniform(-2.0, 2.0)
+                for value in waypoint_deg
+            ]
+            target_rotations_rad = [radians(value) for value in waypoint_with_offset_deg]
             self._move_to_joint_target(
                 target_rotations_rad=target_rotations_rad,
                 tolerance_deg=tolerance_deg,

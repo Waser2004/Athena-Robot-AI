@@ -5,12 +5,15 @@ from __future__ import annotations
 import warnings
 from typing import Callable
 
+import numpy as np
 import torch
 from torch import nn
 
+from cube_localisation.forward_kinematics import RobotFKModel
+
 
 class CubeLocalisationRegressor(nn.Module):
-    """Fuses image features and joint rotations for cube localisation regression."""
+    """Fuses image features and FK-derived end-effector pose for cube localisation regression."""
 
     def __init__(
         self,
@@ -20,6 +23,8 @@ class CubeLocalisationRegressor(nn.Module):
         joint_input_dim: int,
         dropout: float = 0.1,
         joint_hidden_dim: int = 64,
+        joint_mean: np.ndarray | torch.Tensor | None = None,
+        joint_std: np.ndarray | torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.image_encoder = image_encoder
@@ -27,8 +32,36 @@ class CubeLocalisationRegressor(nn.Module):
         if self.joint_input_dim <= 0:
             raise ValueError("joint_input_dim must be > 0.")
 
+        self._fk_model = RobotFKModel()
+        self._fk_joint_count = len(self._fk_model.joints)
+        if self.joint_input_dim != self._fk_joint_count:
+            raise ValueError(
+                f"RobotFKModel expects {self._fk_joint_count} joints, got joint_input_dim={self.joint_input_dim}."
+            )
+        self._fk_ee_joint_index = self._fk_joint_count - 1
+
+        if (joint_mean is None) != (joint_std is None):
+            raise ValueError("joint_mean and joint_std must either both be set or both be None.")
+
+        if joint_mean is not None and joint_std is not None:
+            joint_mean_tensor = torch.as_tensor(joint_mean, dtype=torch.float32).view(-1)
+            joint_std_tensor = torch.as_tensor(joint_std, dtype=torch.float32).view(-1)
+            if joint_mean_tensor.numel() != self.joint_input_dim or joint_std_tensor.numel() != self.joint_input_dim:
+                raise ValueError(
+                    "joint_mean and joint_std must match joint_input_dim. "
+                    f"Expected {self.joint_input_dim}, got {joint_mean_tensor.numel()} and {joint_std_tensor.numel()}."
+                )
+            self.register_buffer("_joint_mean", joint_mean_tensor, persistent=False)
+            self.register_buffer("_joint_std", joint_std_tensor, persistent=False)
+        else:
+            self._joint_mean = None
+            self._joint_std = None
+
+        self._fk_translation_dim = 3
+        self._fk_rotation_dim = 3
+        self._fk_feature_dim = self._fk_translation_dim + (2 * self._fk_rotation_dim)
         self.joint_encoder = nn.Sequential(
-            nn.Linear(self.joint_input_dim, joint_hidden_dim),
+            nn.Linear(self._fk_feature_dim, joint_hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout),
         )
@@ -41,6 +74,25 @@ class CubeLocalisationRegressor(nn.Module):
             nn.Dropout(p=dropout),
             nn.Linear(256, output_dim),
         )
+
+    def _joint_inputs_to_ee_features(self, joint_inputs: torch.Tensor) -> torch.Tensor:
+        if self._joint_mean is not None and self._joint_std is not None:
+            joint_inputs = joint_inputs * self._joint_std + self._joint_mean
+
+        joint_inputs_np = joint_inputs.detach().to(dtype=torch.float32, device="cpu").numpy()
+        ee_features = np.zeros((joint_inputs_np.shape[0], self._fk_feature_dim), dtype=np.float32)
+
+        for sample_index, joint_radians in enumerate(joint_inputs_np):
+            joint_degrees = np.rad2deg(joint_radians)
+            self._fk_model.set_joint_angles(*joint_degrees.tolist())
+            rotation_deg, translation = self._fk_model.get_joint_rot_trans(self._fk_ee_joint_index)
+            rotation_rad = np.deg2rad(np.asarray(rotation_deg, dtype=np.float32))
+
+            ee_features[sample_index, 0:3] = np.asarray(translation, dtype=np.float32)
+            ee_features[sample_index, 3:6] = np.sin(rotation_rad)
+            ee_features[sample_index, 6:9] = np.cos(rotation_rad)
+
+        return torch.from_numpy(ee_features).to(device=joint_inputs.device, dtype=joint_inputs.dtype)
 
     def forward(self, images: torch.Tensor, joint_inputs: torch.Tensor) -> torch.Tensor:
         image_features = self.image_encoder(images)
@@ -56,7 +108,8 @@ class CubeLocalisationRegressor(nn.Module):
                 f"Expected {self.joint_input_dim} joint inputs, got {joint_inputs.shape[1]}."
             )
 
-        joint_features = self.joint_encoder(joint_inputs)
+        ee_features = self._joint_inputs_to_ee_features(joint_inputs)
+        joint_features = self.joint_encoder(ee_features)
         fused_features = torch.cat([image_features, joint_features], dim=1)
         return self.regressor(fused_features)
 
@@ -115,17 +168,19 @@ def _build_efficientnet_backbone(
 
 def build_localisation_model(
     output_dim: int = 2,
-    backbone: str = "resnet18",
+    backbone: str = "resnet34",
     pretrained: bool = True,
     dropout: float = 0.1,
     joint_input_dim: int = 6,
     joint_hidden_dim: int = 64,
+    joint_mean: np.ndarray | torch.Tensor | None = None,
+    joint_std: np.ndarray | torch.Tensor | None = None,
 ) -> nn.Module:
     """
     Build an image+joint regression model.
 
-    `resnet18` is the default because it fine-tunes quickly and works well on
-    small to medium image datasets.
+    `resnet34` is the default for more capacity while keeping ResNet-style
+    training behavior.
     """
     if output_dim <= 0:
         raise ValueError("output_dim must be > 0.")
@@ -155,4 +210,6 @@ def build_localisation_model(
         joint_input_dim=joint_input_dim,
         dropout=dropout,
         joint_hidden_dim=joint_hidden_dim,
+        joint_mean=joint_mean,
+        joint_std=joint_std,
     )
