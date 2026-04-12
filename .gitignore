@@ -16,3 +16,6 @@ runs/
 
 # blender backups
 *.blend1
+
+# VS Code
+.vscode/
