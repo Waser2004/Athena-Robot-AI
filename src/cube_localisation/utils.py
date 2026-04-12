@@ -118,6 +118,8 @@ def suggest_lr(
     plot_file: Path | None = None
     if output_path is not None:
         try:
+            import matplotlib
+            matplotlib.use("Agg", force=True)
             import matplotlib.pyplot as plt
         except ImportError as exc:
             raise ImportError(

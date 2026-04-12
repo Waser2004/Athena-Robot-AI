@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
+
+# Use a non-GUI matplotlib backend for training-time plot exports on desktop/worker threads.
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 import torch
@@ -209,6 +213,8 @@ def save_error_visualization(
     test_region: SpatialRegion | None = None,
 ) -> None:
     try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
     except ImportError as exc:
@@ -299,7 +305,7 @@ def main() -> None:
     WEIGHT_DECAY = 1e-4
     USE_LR_FINDER = True
     APPLY_SUGGESTED_LR = True
-    LR_FINDER_START_LR = 1e-5
+    LR_FINDER_START_LR = 1e-4
     LR_FINDER_END_LR = 1e-1
     LR_FINDER_NUM_ITERS = 120
 

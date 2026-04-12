@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +19,16 @@ from torch.utils.data import Dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET_CANDIDATE = PROJECT_ROOT / "docs" / "Cube_Localisation_dataset"
+DEFAULT_PREGRAB_DATASET_CANDIDATE = PROJECT_ROOT / "docs" / "Cube_Localisation_pregrab_dataset"
+DEFAULT_DATASET_CANDIDATES: tuple[Path, ...] = (
+    DEFAULT_DATASET_CANDIDATE,
+    DEFAULT_PREGRAB_DATASET_CANDIDATE,
+)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+# Joint-sign correction applied while parsing dataset filenames.
+# Index 3 is stored with opposite sign in collected data.
+JOINT_SIGN_CORRECTIONS_ON_LOAD: dict[int, float] = {3: -1.0}
 
 
 def normalize_joint_angles(
@@ -171,10 +180,64 @@ def resolve_dataset_dir(dataset_dir: str | Path | None = None) -> Path:
         raise FileNotFoundError(f"Dataset directory not found: {candidate}")
 
 
-    if DEFAULT_DATASET_CANDIDATE.exists():
-        return DEFAULT_DATASET_CANDIDATE
+    for candidate in DEFAULT_DATASET_CANDIDATES:
+        if candidate.exists():
+            return candidate
 
-    raise FileNotFoundError(f"No dataset directory found. Expected: {DEFAULT_DATASET_CANDIDATE}")
+    expected = ", ".join(str(candidate) for candidate in DEFAULT_DATASET_CANDIDATES)
+    raise FileNotFoundError(f"No dataset directory found. Expected one of: {expected}")
+
+
+def resolve_dataset_dirs(dataset_dir: str | Path | None = None) -> tuple[Path, ...]:
+    """
+    Resolves one or more dataset directories.
+
+    Default behavior (dataset_dir=None):
+    - Loads all available default cube-localisation datasets (main + pregrab).
+
+    Explicit path behavior (dataset_dir provided):
+    - Loads only that directory, except when it points to DEFAULT_DATASET_CANDIDATE,
+      where we also include DEFAULT_PREGRAB_DATASET_CANDIDATE if present.
+    """
+    if dataset_dir is not None:
+        candidate = Path(dataset_dir)
+        if not candidate.exists():
+            raise FileNotFoundError(f"Dataset directory not found: {candidate}")
+
+        try:
+            is_default_main = candidate.resolve() == DEFAULT_DATASET_CANDIDATE.resolve()
+        except OSError:
+            is_default_main = False
+
+        if is_default_main:
+            existing_defaults = tuple(path for path in DEFAULT_DATASET_CANDIDATES if path.exists())
+            if existing_defaults:
+                return existing_defaults
+        return (candidate,)
+
+    candidates = tuple(path for path in DEFAULT_DATASET_CANDIDATES if path.exists())
+    if candidates:
+        return candidates
+
+    expected = ", ".join(str(candidate) for candidate in DEFAULT_DATASET_CANDIDATES)
+    raise FileNotFoundError(f"No dataset directories found. Expected one or more of: {expected}")
+
+
+def _to_openable_image_path(path: Path) -> str:
+    """
+    Returns a filesystem path string suitable for PIL.Image.open.
+
+    On Windows, long dataset filenames can exceed MAX_PATH and raise FileNotFoundError
+    unless opened via the extended-length prefix (\\\\?\\).
+    """
+    path_str = str(path)
+    if os.name != "nt":
+        return path_str
+    if path_str.startswith("\\\\?\\"):
+        return path_str
+    if path_str.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{path_str[2:]}"
+    return f"\\\\?\\{path_str}"
 
 
 def _parse_dataset_filename(file_name: str | Path) -> dict[str, Any]:
@@ -212,6 +275,9 @@ def _parse_dataset_filename(file_name: str | Path) -> dict[str, Any]:
             values["cube_z_rotation_rad"] = float(raw_value)
 
     if joints:
+        for joint_index, sign in JOINT_SIGN_CORRECTIONS_ON_LOAD.items():
+            if joint_index in joints:
+                joints[joint_index] = float(joints[joint_index]) * float(sign)
         values["joint_rotations_rad"] = tuple(joints[idx] for idx in sorted(joints.keys()))
     else:
         values["joint_rotations_rad"] = tuple()
@@ -220,38 +286,40 @@ def _parse_dataset_filename(file_name: str | Path) -> dict[str, Any]:
 
 
 def load_records(dataset_dir: str | Path | None = None) -> list[SampleRecord]:
-    """Loads dataset records by parsing PNG filenames in the specified directory."""
-    root = resolve_dataset_dir(dataset_dir)
+    """Loads dataset records by parsing PNG filenames across one or more dataset directories."""
+    roots = resolve_dataset_dirs(dataset_dir)
     records: list[SampleRecord] = []
 
-    for image_path in sorted(root.glob("*.png")):
-        # parse and validate metadata from filename, skip if required keys are missing
-        parsed = _parse_dataset_filename(image_path.name)
-        required = ("cube_x_m", "cube_y_m", "cube_z_m", "cube_z_rotation_rad")
-        if any(key not in parsed for key in required):
-            continue
-        
-        # create a SampleRecord for this image and add to the list
-        cube_z_rotation_rad = float(parsed["cube_z_rotation_rad"])
-        cube_z_rotation_sin4, cube_z_rotation_cos4 = encode_cube_z_rotation_fourfold(cube_z_rotation_rad)
+    for root in roots:
+        for image_path in sorted(root.glob("*.png")):
+            # parse and validate metadata from filename, skip if required keys are missing
+            parsed = _parse_dataset_filename(image_path.name)
+            required = ("cube_x_m", "cube_y_m", "cube_z_m", "cube_z_rotation_rad")
+            if any(key not in parsed for key in required):
+                continue
 
-        records.append(
-            SampleRecord(
-                image_path=image_path,
-                sample_index=parsed.get("sample_index"),
-                waypoint_index=parsed.get("waypoint_index"),
-                joint_rotations_rad=tuple(parsed.get("joint_rotations_rad", tuple())),
-                cube_x_m=float(parsed["cube_x_m"]),
-                cube_y_m=float(parsed["cube_y_m"]),
-                cube_z_m=float(parsed["cube_z_m"]),
-                cube_z_rotation_rad=cube_z_rotation_rad,
-                cube_z_rotation_sin4=cube_z_rotation_sin4,
-                cube_z_rotation_cos4=cube_z_rotation_cos4,
+            # create a SampleRecord for this image and add to the list
+            cube_z_rotation_rad = float(parsed["cube_z_rotation_rad"])
+            cube_z_rotation_sin4, cube_z_rotation_cos4 = encode_cube_z_rotation_fourfold(cube_z_rotation_rad)
+
+            records.append(
+                SampleRecord(
+                    image_path=image_path,
+                    sample_index=parsed.get("sample_index"),
+                    waypoint_index=parsed.get("waypoint_index"),
+                    joint_rotations_rad=tuple(parsed.get("joint_rotations_rad", tuple())),
+                    cube_x_m=float(parsed["cube_x_m"]),
+                    cube_y_m=float(parsed["cube_y_m"]),
+                    cube_z_m=float(parsed["cube_z_m"]),
+                    cube_z_rotation_rad=cube_z_rotation_rad,
+                    cube_z_rotation_sin4=cube_z_rotation_sin4,
+                    cube_z_rotation_cos4=cube_z_rotation_cos4,
+                )
             )
-        )
 
     if not records:
-        raise RuntimeError(f"No valid PNG records found in {root}")
+        loaded_from = ", ".join(str(root) for root in roots)
+        raise RuntimeError(f"No valid PNG records found in: {loaded_from}")
 
     return records
 
@@ -583,7 +651,7 @@ class CubeLocalisationDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Te
 
     def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         record = self.records[self.indices[item]]
-        with Image.open(record.image_path) as img:
+        with Image.open(_to_openable_image_path(record.image_path)) as img:
             image = self.transform(img.convert("RGB"))
 
         joint_rotations = np.asarray(record.joint_rotations_rad, dtype=np.float32)

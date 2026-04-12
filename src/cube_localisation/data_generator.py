@@ -7,7 +7,7 @@ import random
 import sys
 import time
 from dataclasses import asdict, dataclass
-from math import pi, radians, sqrt
+from math import atan2, degrees, pi, radians, sqrt
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +15,10 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import numpy as np
+
+from cube_localisation.forward_kinematics import RobotFKModel
+from cube_localisation.inverse_kinematics import InverseKinematics
 from robot_venv.EnvInterface import EnvInteface
 
 try:
@@ -70,6 +74,8 @@ class DataGenerationConfig:
     z_rotation_intervals: int = 1
     rotation_iteration_amount: int = 1
     robot_pose: str = "home"
+    pregrab_pose_mode: bool = False
+    pregrab_joint_target_jitter_deg: float = 0.0
     reset_before_each_sample: bool = True
     include_image: bool = False
     seed: int | None = None
@@ -87,6 +93,8 @@ class DataGenerationConfig:
             raise ValueError("rotation_iteration_amount must be > 0")
         if self.z_rotation_min_rad > self.z_rotation_max_rad:
             raise ValueError("z_rotation_min_rad must be <= z_rotation_max_rad")
+        if float(self.pregrab_joint_target_jitter_deg) < 0.0:
+            raise ValueError("pregrab_joint_target_jitter_deg must be >= 0")
         self.workplate_bounds_cm.validate()
 
 
@@ -114,6 +122,9 @@ class DataGenerator:
     def __init__(self, env: EnvInteface, search_path: list[list[float]] | None = None) -> None:
         self.env = env
         self.search_path = search_path if search_path is not None else load_search_path()
+        self._ik_solver = InverseKinematics()
+        self._fk_model = RobotFKModel()
+        self._fk_ee_joint_index = len(self._fk_model.joints) - 1
 
     @staticmethod
     def _build_bins(min_cm: float, max_cm: float, box_size_cm: float) -> list[tuple[float, float]]:
@@ -437,6 +448,232 @@ class DataGenerator:
         img.putdata(pixels_uint8)
         img.save(output_file, format="PNG")
 
+    @staticmethod
+    def _build_grab_pose_from_target_cube(
+        cube_location_m: list[float],
+        cube_rotation_rad: list[float],
+    ) -> tuple[list[float], list[float]]:
+        """
+        Build grab pose from cube pose, matching Lyra `GrabStateHandler._build_grab_pose`.
+        """
+        if len(cube_location_m) != 3 or len(cube_rotation_rad) != 3:
+            raise ValueError("cube_location_m and cube_rotation_rad must contain 3 values each")
+
+        x_mm = float(cube_location_m[0]) * 1000.0
+        y_mm = float(cube_location_m[1]) * 1000.0
+        distance_to_target = sqrt((x_mm**2) + (y_mm**2))
+        cube_yaw_deg = degrees(float(cube_rotation_rad[2]))
+
+        # Cube is 90deg-symmetric: evaluate all 4 equivalent grasp yaws and choose
+        # the one whose "front" points towards the robot (cube->base line direction).
+        cube_to_robot_deg = degrees(atan2(-y_mm, -x_mm))
+
+        def _wrap_deg(angle_deg: float) -> float:
+            return (angle_deg + 180.0) % 360.0 - 180.0
+
+        def _angular_distance_deg(a_deg: float, b_deg: float) -> float:
+            return abs(_wrap_deg(a_deg - b_deg))
+
+        yaw_candidates_deg = [cube_yaw_deg + 90.0 * idx for idx in range(4)]
+        best_yaw_deg = min(
+            yaw_candidates_deg,
+            key=lambda candidate: _angular_distance_deg(candidate, cube_to_robot_deg),
+        )
+
+        location_mm = [x_mm, y_mm, 25.0]
+        rotation_deg = [
+            -25.0 if distance_to_target > 440.0 else -90.0,
+            0.0,
+            best_yaw_deg,
+        ]
+        return location_mm, rotation_deg
+
+    @staticmethod
+    def _build_pregrab_position(grab_location_mm: list[float], grab_rotation_deg: list[float]) -> list[float]:
+        """
+        Build pregrab position, matching Lyra `GrabStateHandler._build_pregrab_position`.
+        """
+        if len(grab_location_mm) != 3 or len(grab_rotation_deg) != 3:
+            raise ValueError("grab_location_mm and grab_rotation_deg must contain 3 values each")
+
+        # Import lazily so existing non-pregrab generation still works without scipy.
+        try:
+            from scipy.spatial.transform import Rotation
+        except ImportError as exc:
+            raise RuntimeError("scipy is required for pregrab pose mode. Install with: pip install scipy") from exc
+
+        offset_mm = 100
+        end_eff_rot = Rotation.from_euler(
+            "xyz",
+            [
+                radians(float(grab_rotation_deg[1])),
+                radians(float(grab_rotation_deg[0])),
+                radians(float(grab_rotation_deg[2])),
+            ],
+        )
+        end_eff_mat = end_eff_rot.as_matrix()
+        target_3_mat = end_eff_mat @ [[offset_mm], [0], [0.0]]
+
+        # Pregrab is defined as a pure translation away from the grab pose:
+        # pregrab = grab + R * [0, -offset, 0]
+        return [
+            float(grab_location_mm[1]) + float(target_3_mat.item(1)),
+            float(grab_location_mm[0]) + float(target_3_mat.item(0)),
+            float(grab_location_mm[2]) + float(target_3_mat.item(2)),
+        ]
+
+    def _resolve_joint_rotations_rad_from_pose(self, position_mm: list[float], rotation_deg: list[float]) -> list[float]:
+        """
+        Resolve IK for the requested end-effector pose using Lyra adapter conventions.
+        """
+        if len(position_mm) != 3 or len(rotation_deg) != 3:
+            raise ValueError("position_mm and rotation_deg must contain 3 values each")
+
+        # Normalize pose for IK solver (same coordinate/sign normalization as Lyra).
+        ik_position_mm = [float(value) for value in position_mm]
+        ik_rotation_deg = [float(value) for value in rotation_deg]
+        ik_position_mm[0], ik_position_mm[1] = -ik_position_mm[0], -ik_position_mm[1]
+        ik_rotation_deg[2] = -ik_rotation_deg[2]
+
+        print(ik_position_mm, ik_rotation_deg)
+
+        self._ik_solver.set_end_effector(ik_position_mm, ik_rotation_deg)
+        joint_rotations_deg = self._ik_solver.calc_inverse_kinematics()
+
+        joint_rotations_deg[0] -= 90.0
+        joint_rotations_deg[2], joint_rotations_deg[3], joint_rotations_deg[5] = -joint_rotations_deg[2], -joint_rotations_deg[3], -joint_rotations_deg[5]
+
+        # Normalize joint angles for robot convention (same as Lyra).
+        print(f"Resolved IK joint angles (deg): {joint_rotations_deg}")
+        return [radians(float(value)) for value in joint_rotations_deg]
+
+    def _get_end_effector_pose_from_joint_rotations(
+        self,
+        joint_rotations_rad: list[float],
+    ) -> tuple[list[float], np.ndarray]:
+        """
+        Compute end-effector position (mm) and rotation matrix from actuator joints.
+        """
+        if len(joint_rotations_rad) != 6:
+            raise ValueError("joint_rotations_rad must contain 6 values")
+
+        joint_rotations_deg = [degrees(float(value)) for value in joint_rotations_rad]
+        self._fk_model.set_joint_angles(*joint_rotations_deg)
+        ee_transform = self._fk_model.get_joint_transform(self._fk_ee_joint_index)
+        ee_transform = np.asarray(ee_transform, dtype=float)
+
+        ee_position_mm = [
+            float(ee_transform[0, 3]),
+            float(ee_transform[1, 3]),
+            float(ee_transform[2, 3]),
+        ]
+        ee_rotation_matrix = ee_transform[:3, :3]
+        return ee_position_mm, ee_rotation_matrix
+
+    @staticmethod
+    def _build_pregrab_from_actual_grab_frame(
+        grab_position_mm: list[float],
+        grab_rotation_matrix: np.ndarray,
+        offset_mm: float = 100.0,
+    ) -> list[float]:
+        """
+        Build pregrab from actual achieved grab frame:
+        pregrab = grab + R_actual * [0, -offset, 0].
+        """
+        if len(grab_position_mm) != 3:
+            raise ValueError("grab_position_mm must contain 3 values")
+        if grab_rotation_matrix.shape != (3, 3):
+            raise ValueError("grab_rotation_matrix must be shape (3, 3)")
+
+        retreat_local = np.array([[0.0], [-float(offset_mm)], [0.0]], dtype=float)
+        retreat_world = grab_rotation_matrix @ retreat_local
+        return [
+            float(grab_position_mm[0] + retreat_world.item(0)),
+            float(grab_position_mm[1] + retreat_world.item(1)),
+            float(grab_position_mm[2] + retreat_world.item(2)),
+        ]
+
+    def move_to_pregrab_position_and_capture_image(
+        self,
+        padding: float = 0.05,
+        dataset_dir: str | Path | None = None,
+        tolerance_deg: float = 0.1,
+        max_control_steps: int = 2000,
+        search_speed_multiplier: float = 1.0,
+        pregrab_joint_target_jitter_deg: float = 0.0,
+        rng: random.Random | None = None,
+        sample_index: int | None = None,
+        quiet: bool = False,
+    ) -> Path | None:
+        """
+        Move robot to IK-resolved pregrab pose for the current cube, then capture one labeled image.
+        """
+        output_dir = Path(dataset_dir) if dataset_dir is not None else DEFAULT_CUBE_LOCALISATION_DATASET_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_grapper_open()
+
+        cube_state = self.env.get_state(
+            actuator_rotations=False,
+            actuator_velocities=False,
+            target_cube_state=True,
+            graper=False,
+            collisions=False,
+            workplate_coverage=False,
+            distance_to_target=False,
+            image=False,
+        )
+
+        grab_location_mm, grab_rotation_deg = self._build_grab_pose_from_target_cube(
+            cube_location_m=[float(value) for value in cube_state["target_cube_location"]],
+            cube_rotation_rad=[float(value) for value in cube_state["target_cube_rotation"]],
+        )
+        pregrab_location_mm = self._build_pregrab_position(grab_location_mm, grab_rotation_deg)
+        pregrab_joint_rotations_rad = self._resolve_joint_rotations_rad_from_pose(pregrab_location_mm, grab_rotation_deg)
+        if pregrab_joint_target_jitter_deg > 0.0:
+            joint_rng = rng if rng is not None else random.Random()
+            jitter_rad = radians(float(pregrab_joint_target_jitter_deg))
+            pregrab_joint_rotations_rad = [
+                float(value) + joint_rng.uniform(-jitter_rad, jitter_rad)
+                for value in pregrab_joint_rotations_rad
+            ]
+
+        self._move_to_joint_target(
+            target_rotations_rad=pregrab_joint_rotations_rad,
+            tolerance_deg=tolerance_deg,
+            max_control_steps=max_control_steps,
+            grapper_state=False,
+            search_speed_multiplier=search_speed_multiplier,
+        )
+
+        if not self.env.target_cube_within_padding(padding=padding):
+            if not quiet:
+                print("Cube was not found within camera padding at pregrab pose.")
+            return None
+
+        state = self.env.get_state(
+            actuator_rotations=True,
+            actuator_velocities=False,
+            target_cube_state=True,
+            graper=False,
+            collisions=False,
+            workplate_coverage=False,
+            distance_to_target=False,
+            image=True,
+        )
+
+        file_name = self.build_dataset_filename(
+            waypoint_index=-1,
+            joint_rotations_rad=[float(value) for value in state["actuator_rotations"]],
+            cube_location_m=[float(value) for value in state["target_cube_location"]],
+            cube_z_rotation_rad=float(state["target_cube_rotation"][2]),
+            sample_index=sample_index,
+        )
+        output_path = output_dir / file_name
+        self._save_grayscale_png(state["image"], output_path)
+        if not quiet:
+            print(f"Saved labeled image (pregrab pose): {output_path}")
+        return output_path
+
     def move_along_search_path_to_cube(
         self,
         padding: float = 0.05,
@@ -463,7 +700,7 @@ class DataGenerator:
                 raise ValueError(f"Expected 6 joint values per waypoint, got {len(waypoint_deg)} at index {waypoint_index}")
 
             waypoint_with_offset_deg = [
-                float(value) + random.uniform(-2.0, 2.0)
+                float(value) + random.uniform(-2, 2)
                 for value in waypoint_deg
             ]
             target_rotations_rad = [radians(value) for value in waypoint_with_offset_deg]
@@ -521,7 +758,7 @@ class DataGenerator:
         """
         Full dataset generation pipeline:
         1) sample cube poses from grid/rotation config
-        2) move robot along search path
+        2) either move robot along search path or directly to IK pregrab pose
         3) save one labeled image once cube satisfies camera padding rule
         """
         config.validate()
@@ -533,6 +770,7 @@ class DataGenerator:
         output_dir = Path(dataset_dir) if dataset_dir is not None else DEFAULT_CUBE_LOCALISATION_DATASET_DIR
         output_dir.mkdir(parents=True, exist_ok=True)
         rng_padding = random.Random(config.seed)
+        rng_pregrab_joint_target = random.Random(None if config.seed is None else config.seed + 1)
 
         total_planned = self.count_data_points(config)
         limit = total_planned if max_samples is None else min(max_samples, total_planned)
@@ -562,26 +800,40 @@ class DataGenerator:
                 )
 
                 sample_padding = rng_padding.uniform(padding_min, padding_max)
-                saved_path = self.move_along_search_path_to_cube(
-                    padding=sample_padding,
-                    dataset_dir=output_dir,
-                    tolerance_deg=tolerance_deg,
-                    max_control_steps_per_waypoint=max_control_steps_per_waypoint,
-                    search_speed_multiplier=search_speed_multiplier,
-                    sample_index=sample_index,
-                    quiet=True,
-                )
+                if config.pregrab_pose_mode:
+                    saved_path = self.move_to_pregrab_position_and_capture_image(
+                        padding=sample_padding,
+                        dataset_dir=output_dir,
+                        tolerance_deg=tolerance_deg,
+                        max_control_steps=max_control_steps_per_waypoint,
+                        search_speed_multiplier=search_speed_multiplier,
+                        pregrab_joint_target_jitter_deg=config.pregrab_joint_target_jitter_deg,
+                        rng=rng_pregrab_joint_target,
+                        sample_index=sample_index,
+                        quiet=True,
+                    )
+                else:
+                    saved_path = self.move_along_search_path_to_cube(
+                        padding=sample_padding,
+                        dataset_dir=output_dir,
+                        tolerance_deg=tolerance_deg,
+                        max_control_steps_per_waypoint=max_control_steps_per_waypoint,
+                        search_speed_multiplier=search_speed_multiplier,
+                        sample_index=sample_index,
+                        quiet=True,
+                    )
+                mode_label = "pregrab" if config.pregrab_pose_mode else "search_path"
                 if saved_path is None:
                     not_found += 1
                     print(
                         f"[{processed}/{limit}] sample={sample_index} "
-                        f"padding={sample_padding:.4f} not found in padded camera view"
+                        f"mode={mode_label} padding={sample_padding:.4f} not found in padded camera view"
                     )
                 else:
                     saved += 1
                     print(
                         f"[{processed}/{limit}] sample={sample_index} "
-                        f"padding={sample_padding:.4f} saved={saved_path.name}"
+                        f"mode={mode_label} padding={sample_padding:.4f} saved={saved_path.name}"
                     )
             except Exception as exc:
                 failed += 1
@@ -773,6 +1025,8 @@ if __name__ == "__main__":
     JOINT_TOLERANCE_DEG = 0.1
     MAX_CONTROL_STEPS_PER_WAYPOINT = 2000
     SEARCH_SPEED_MULTIPLIER = 5.0  # 1.0 = baseline, 2.0 = ~2x, 3.0 = ~3x
+    PREGRAB_POSE_MODE = True  # True => generate only IK-resolved pregrab-pose images
+    PREGRAB_JOINT_TARGET_JITTER_DEG = 2.0  # +/- deg applied to each target joint in pregrab mode
     TEST_DELAY_SECONDS = 0.1
     MAX_SAMPLES = None  # e.g. 100 for a short run
     STOP_ON_ERROR = False
@@ -787,6 +1041,8 @@ if __name__ == "__main__":
         z_rotation_intervals=4,
         rotation_iteration_amount=2,
         robot_pose="home",
+        pregrab_pose_mode=PREGRAB_POSE_MODE,
+        pregrab_joint_target_jitter_deg=PREGRAB_JOINT_TARGET_JITTER_DEG,
         reset_before_each_sample=False,
         include_image=False,
         seed=None,
