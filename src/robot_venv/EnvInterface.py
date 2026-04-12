@@ -146,6 +146,17 @@ class EnvInteface:
         )
         return bool(result)
 
+    def cube_visibility_labels(self) -> dict[str, Any]:
+        """Return cube visibility labels used by the cube detection data generator."""
+        result = self._send_request(
+            function="cube_visibility_labels",
+            args={},
+            expect_response=True,
+        )
+        if not isinstance(result, dict):
+            raise EnvInterfaceError("Unexpected response type for cube_visibility_labels")
+        return result
+
     def call(self, function: str, args: dict[str, Any] | None = None, expect_response: bool = True) -> Any:
         """Low-level access for additional server functions."""
         return self._send_request(function=function, args=args or {}, expect_response=expect_response)

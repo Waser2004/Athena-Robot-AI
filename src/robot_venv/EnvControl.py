@@ -177,17 +177,87 @@ class RobotEnv:
         mesh = self.target_cube.data
         world_matrix = self.target_cube.matrix_world
 
+        # All cube vertices must lie inside the padded camera frame.
+        # If any vertex falls outside (or behind camera), the cube is not fully visible.
         for vertex in mesh.vertices:
             world_coord = world_matrix @ vertex.co
             co_ndc = world_to_camera_view(scene, self.camera, world_coord)
 
-            if (0.0 + padding <= co_ndc.x <= 1.0 - padding and
-                0.0 + padding <= co_ndc.y <= 1.0 - padding and
-                co_ndc.z > 0):
-
-                return True
+            if not (
+                0.0 + padding <= co_ndc.x <= 1.0 - padding
+                and 0.0 + padding <= co_ndc.y <= 1.0 - padding
+                and co_ndc.z > 0
+            ):
+                return False
         
-        return False
+        return True
+
+    def cube_visibility_labels(self) -> dict[str, float | bool | str]:
+        """
+        Calculate continuous cube-visibility labels in normalized image coordinates.
+
+        Mirrors the historical cube-detection generator logic so filename labels
+        remain compatible with existing training data parsing.
+        """
+        bpy.context.view_layer.update()  # Force update of transforms
+        scene = bpy.context.scene
+        mesh = self.target_cube.data
+        world_matrix = self.target_cube.matrix_world
+
+        projected_vertices: list[tuple[float, float, float]] = []
+        for vertex in mesh.vertices:
+            world_coord = world_matrix @ vertex.co
+            co_ndc = world_to_camera_view(scene, self.camera, world_coord)
+            projected_vertices.append((float(co_ndc.x), float(co_ndc.y), float(co_ndc.z)))
+
+        front_vertices = [(x, y) for x, y, z in projected_vertices if z > 0.0]
+        if not front_vertices:
+            return {
+                "cube_visible": False,
+                "label": "no_cube_visible",
+                "visible_image_ratio": 0.0,
+                "inframe_fraction": 0.0,
+                "edge_margin": -1.0,
+            }
+
+        xs = [x for x, _ in front_vertices]
+        ys = [y for _, y in front_vertices]
+        min_x = min(xs)
+        max_x = max(xs)
+        min_y = min(ys)
+        max_y = max(ys)
+
+        raw_w = max(max_x - min_x, 0.0)
+        raw_h = max(max_y - min_y, 0.0)
+        raw_area = raw_w * raw_h
+
+        clip_min_x = max(min_x, 0.0)
+        clip_max_x = min(max_x, 1.0)
+        clip_min_y = max(min_y, 0.0)
+        clip_max_y = min(max_y, 1.0)
+
+        clipped_w = max(clip_max_x - clip_min_x, 0.0)
+        clipped_h = max(clip_max_y - clip_min_y, 0.0)
+        clipped_area = clipped_w * clipped_h
+
+        visible_image_ratio = min(max(clipped_area, 0.0), 1.0)
+        if raw_area > 1e-12:
+            inframe_fraction = min(max(clipped_area / raw_area, 0.0), 1.0)
+        else:
+            inframe_fraction = 1.0 if clipped_area > 0.0 else 0.0
+
+        edge_margin = min(min_x, 1.0 - max_x, min_y, 1.0 - max_y)
+        cube_visible = clipped_area > 0.0
+        if not cube_visible:
+            cube_visible = any(0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 for x, y in front_vertices)
+
+        return {
+            "cube_visible": bool(cube_visible),
+            "label": "cube_visible" if cube_visible else "no_cube_visible",
+            "visible_image_ratio": float(visible_image_ratio),
+            "inframe_fraction": float(inframe_fraction),
+            "edge_margin": float(edge_margin),
+        }
 
     def get_state(
             self, 
@@ -546,6 +616,11 @@ class RLServerModalOperator(bpy.types.Operator):
                                     "checked padded cube visibility: "
                                     f"padding={request['args'].get('padding', 0.1)} result={result}"
                                 )
+
+                            if request["function"] == "cube_visibility_labels":
+                                result = env.cube_visibility_labels()
+                                send_response(self._client_conn, {"result": result})
+                                print(f"computed cube visibility labels: {result}")
 
                             if request["function"] == "set_robot_pose":
                                 env.set_robot_pose(request["args"]["actuator_rotations"])

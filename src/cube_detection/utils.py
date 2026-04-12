@@ -23,6 +23,24 @@ class LRSuggestion:
     plot_path: Path | None = None
 
 
+def _as_prediction_vector(outputs: torch.Tensor) -> torch.Tensor:
+    """Normalize model outputs to a 1D regression vector."""
+    if outputs.ndim == 2 and outputs.shape[1] == 1:
+        return outputs.squeeze(1)
+    if outputs.ndim == 1:
+        return outputs
+    raise ValueError(f"Expected model output shape [N] or [N,1], got {tuple(outputs.shape)}")
+
+
+def _as_target_vector(targets: torch.Tensor) -> torch.Tensor:
+    """Normalize targets to a 1D regression vector."""
+    if targets.ndim == 2 and targets.shape[1] == 1:
+        return targets.squeeze(1)
+    if targets.ndim == 1:
+        return targets
+    raise ValueError(f"Expected target shape [N] or [N,1], got {tuple(targets.shape)}")
+
+
 def suggest_lr(
     model: nn.Module,
     loader: Iterable[tuple[torch.Tensor, torch.Tensor]],
@@ -71,7 +89,8 @@ def suggest_lr(
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(images)
+            logits = _as_prediction_vector(model(images))
+            labels = _as_target_vector(labels)
             loss = loss_fn(logits, labels)
             loss.backward()
             optimizer.step()
@@ -145,4 +164,3 @@ def suggest_lr(
         losses=losses,
         plot_path=plot_file,
     )
-
