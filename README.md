@@ -1,33 +1,36 @@
-# Orpheus
+# Athena (Robot AI)
 
-This repository provides the data generation and model training scripts for
+The AI training and model development layer of the robotic system. Athena handles machine learning, data pipelines, simulation, training, and evaluation to enable the robot's perception and decision-making capabilities.
 
-- Cube detection
-- Cube localisation
+## Role in the Ecosystem
 
-## Cube Localisation Finetuning
+Athena is part of a three-layer robotic architecture:
 
-New PyTorch scaffold scripts are available in `src/cube_localisation`:
+- **[Athena](https://github.com/Waser2004/Athena-Robot-AI)** → AI Training & Model Development  
+  Handles machine learning, data pipelines, simulation, training, and evaluation
+  
+- **[Hermes](https://github.com/Waser2004/Hermes-Robot-Control)** → Control & Orchestration Layer  
+  Manages API endpoints, command logic, system communication, and high-level task execution
+  
+- **[Hephaestus](https://github.com/Waser2004/Hephaestus-Robot-Firmware)** → Embedded & Hardware Layer  
+  Runs firmware, microcontroller logic, low-level motor control, and sensor management
 
-- `dataset.py`: PNG loading + filename label parsing + spatial train/val/test split by random workplate region.
-- `model.py`: pretrained backbone factory (`resnet34` default) with regression head.
-- `train.py`: finetuning script with TensorBoard logging and checkpointing.
-- `evaluate.py`: validation/test evaluation script using the same spatial split logic.
+## What This Repository Does
 
-Install dependencies:
+This repository provides the data generation and model training scripts for:
 
-```bash
-pip install -r src/cube_localisation/requirements.txt
-```
+- **Cube Detection** - Training models to identify the target cube in images
+- **Cube Localisation** - Fine-tuning models to determine precise 3D positions of the target cube
 
-Train:
+## Model Architecture Overview
 
-```bash
-python src/cube_localisation/train.py --epochs 40 --batch-size 32
-```
+**Cube Detection Pipeline:**
+- Uses a CNN-based object detector to identify and locate the cube's bounding box in the image
+- Outputs: Whether a cube is visible and its approximate location
 
-Evaluate best checkpoint on test split:
+**Cube Localisation Pipeline:**
+- Takes detected cube regions and refines them with a pre-trained backbone (ResNet34) + regression head
+- Outputs: Precise 3D coordinates (x, y, z) for the cube's position in space
+- Trained on spatially-split datasets to ensure robustness across different workplate regions
 
-```bash
-python src/cube_localisation/evaluate.py --checkpoint runs/cube_localisation/<run_name>/checkpoints/best.pt --split test
-```
+The two models work in sequence: Detection identifies the cube, then Localisation determines its exact position for the robot to grasp.

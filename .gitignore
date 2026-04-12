@@ -2,9 +2,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+.venv/
+.venv_check/
+
 # Datasets
 Cube_Detection_dataset/
 Cube_Localisation_dataset/
+Cube_Localisation_pregrab_dataset/
 Cube_Localisation_dataset_tmp/
 
 # Logs and checkpoints
