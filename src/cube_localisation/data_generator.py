@@ -502,7 +502,12 @@ class DataGenerator:
         except ImportError as exc:
             raise RuntimeError("scipy is required for pregrab pose mode. Install with: pip install scipy") from exc
 
-        offset_mm = 100
+        # random target offset for more diverse pregrap poses
+        distance_to_target = sqrt((grab_location_mm[0] ** 2) + (grab_location_mm[1] ** 2))
+        offset_mm = random.uniform(80.0, 120.0)
+        if distance_to_target > 440.0:
+            distance_to_target = random.uniform(60.0, 180.0)
+
         end_eff_rot = Rotation.from_euler(
             "xyz",
             [
@@ -1020,8 +1025,8 @@ if __name__ == "__main__":
 
     DATASET_DIR = DEFAULT_CUBE_LOCALISATION_DATASET_DIR
     CAMERA_PADDING = 0.05
-    CAMERA_PADDING_MIN = 0.05
-    CAMERA_PADDING_MAX = 0.2
+    CAMERA_PADDING_MIN = 0.1
+    CAMERA_PADDING_MAX = 0.3
     JOINT_TOLERANCE_DEG = 0.1
     MAX_CONTROL_STEPS_PER_WAYPOINT = 2000
     SEARCH_SPEED_MULTIPLIER = 5.0  # 1.0 = baseline, 2.0 = ~2x, 3.0 = ~3x

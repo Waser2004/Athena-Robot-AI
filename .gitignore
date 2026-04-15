@@ -9,6 +9,7 @@ __pycache__/
 Cube_Detection_dataset/
 Cube_Localisation_dataset/
 Cube_Localisation_pregrab_dataset/
+Cube_Localisation_pregrab_dataset v1/
 Cube_Localisation_dataset_tmp/
 
 # Logs and checkpoints

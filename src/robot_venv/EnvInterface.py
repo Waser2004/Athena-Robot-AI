@@ -138,7 +138,7 @@ class EnvInteface:
         return float(result)
 
     def target_cube_within_padding(self, padding: float = 0.1) -> bool:
-        """Return True if projected cube bbox lies inside camera view with given padding."""
+        """Return True if projected cube overlaps camera view after applying padding."""
         result = self._send_request(
             function="target_cube_within_padding",
             args={"padding": float(padding)},

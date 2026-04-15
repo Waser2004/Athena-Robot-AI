@@ -3,6 +3,7 @@ import time
 import random
 import socket
 import struct
+from pathlib import Path
 import numpy as np
 from math import sqrt, radians, pi, degrees
 
@@ -48,6 +49,12 @@ class RobotEnv:
         self.light_fenster = bpy.data.objects["Fenster"]
         self.light_decke = bpy.data.objects["Decke"]
         self.light_sessel = bpy.data.objects["Sessel"]
+
+        # Cache frequently reused data / nodes for long generation runs.
+        self._workplate_grid_points: np.ndarray | None = None
+        self._workplate_grid_file = Path(__file__).resolve().parent / "docs" / "grid_centers.txt"
+        self._image_capture_nodes: dict[str, bpy.types.Node] = {}
+        self._captured_frame_count = 0
     
     def set_robot_pose(self, actuator_rotations: list[float]):
         """This function sets the robot to a defined pose based on the actuator rotations"""
@@ -59,11 +66,6 @@ class RobotEnv:
         self.robot_objects["tertiary arm - part 2"].rotation_euler.y = actuator_rotations[5]
         self.robot_objects["finger - right"].rotation_euler.z = pi
         self.robot_objects["finger - left"].rotation_euler.z = pi
-
-        # Print the world rotation (Euler angles) of "secondary arm - part 2"
-        secondary_arm_obj = self.robot_objects["secondary arm - part 2"]
-        world_euler = secondary_arm_obj.matrix_world.to_euler('XYZ')
-        print(f"Secondary Arm part 2 world rotation (radians): x={world_euler.x}, y={world_euler.y}, z={world_euler.z}")
 
     def set_cube_pose(self, x: float, y: float, z: float = 0.025, yaw: float | None = None):
         """Set target cube pose on the workplate."""
@@ -169,28 +171,35 @@ class RobotEnv:
 
     def target_cube_within_padding(self, padding: float = 0.1) -> bool:
         """
-        Returns True if the full projected cube bbox is inside [padding, 1-padding]
-        in both x and y camera coordinates.
+        Returns True if any part of the projected cube overlaps the padded
+        camera region [padding, 1-padding] in both x and y.
         """
         bpy.context.view_layer.update()  # Force update of transforms
         scene = bpy.context.scene
         mesh = self.target_cube.data
         world_matrix = self.target_cube.matrix_world
 
-        # All cube vertices must lie inside the padded camera frame.
-        # If any vertex falls outside (or behind camera), the cube is not fully visible.
+        # Consider only vertices in front of the camera.
+        front_vertices: list[tuple[float, float]] = []
         for vertex in mesh.vertices:
             world_coord = world_matrix @ vertex.co
             co_ndc = world_to_camera_view(scene, self.camera, world_coord)
+            if co_ndc.z > 0:
+                front_vertices.append((float(co_ndc.x), float(co_ndc.y)))
 
-            if not (
-                0.0 + padding <= co_ndc.x <= 1.0 - padding
-                and 0.0 + padding <= co_ndc.y <= 1.0 - padding
-                and co_ndc.z > 0
-            ):
-                return False
-        
-        return True
+        if not front_vertices:
+            return False
+
+        xs, ys = zip(*front_vertices)
+        cube_min_x, cube_max_x = min(xs), max(xs)
+        cube_min_y, cube_max_y = min(ys), max(ys)
+
+        inner_min_x, inner_max_x = 0.0 + padding, 1.0 - padding
+        inner_min_y, inner_max_y = 0.0 + padding, 1.0 - padding
+
+        overlaps_x = max(cube_min_x, inner_min_x) <= min(cube_max_x, inner_max_x)
+        overlaps_y = max(cube_min_y, inner_min_y) <= min(cube_max_y, inner_max_y)
+        return overlaps_x and overlaps_y
 
     def cube_visibility_labels(self) -> dict[str, float | bool | str]:
         """
@@ -323,40 +332,29 @@ class RobotEnv:
         # image
         if image:
             scene = bpy.context.scene
-            scene.use_nodes = True
-            tree = scene.node_tree
-            links = tree.links
-
-            # Clear default nodes
-            for node in tree.nodes:
-                tree.nodes.remove(node)
-
-            # Add Render Layers node
-            rl = tree.nodes.new('CompositorNodeRLayers')
-            rl.location = (185, 285)
-
-            # Add RGB to BW node (grayscale conversion)
-            rgb2bw = tree.nodes.new('CompositorNodeRGBToBW')
-            rgb2bw.location = (400, 285)
-
-            # Add Viewer node
-            v = tree.nodes.new('CompositorNodeViewer')
-            v.location = (750, 210)
-            v.use_alpha = False
-
-            # Link Render Layers → RGB to BW → Viewer
-            links.new(rl.outputs['Image'], rgb2bw.inputs['Image'])
-            links.new(rgb2bw.outputs['Val'], v.inputs['Image'])
+            _, _, viewer_node = self._ensure_grayscale_capture_nodes(scene)
 
             # Render
             bpy.ops.render.render(write_still=False)
 
             # Access pixel data from Viewer Node
-            viewer_image = bpy.data.images['Viewer Node']
-            w, h = scene.render.resolution_x, scene.render.resolution_y
-            arr = np.array(viewer_image.pixels[:], dtype=np.float32)
-            arr = arr.reshape((h, w, 4))[:, :, 0]  # Only one channel (grayscale)
+            viewer_image = getattr(viewer_node, "image", None)
+            if viewer_image is None:
+                viewer_image = bpy.data.images.get("Viewer Node")
+            if viewer_image is None:
+                raise RuntimeError("Viewer Node image buffer is unavailable after rendering.")
+
+            w, h = int(viewer_image.size[0]), int(viewer_image.size[1])
+            if w <= 0 or h <= 0:
+                w, h = scene.render.resolution_x, scene.render.resolution_y
+            flat_pixels = np.empty(w * h * 4, dtype=np.float32)
+            viewer_image.pixels.foreach_get(flat_pixels)
+            arr = flat_pixels.reshape((h, w, 4))[:, :, 0]  # Grayscale channel
             return_values.update({"image": arr.tolist()})
+
+            self._captured_frame_count += 1
+            if self._captured_frame_count % 200 == 0:
+                self._cleanup_orphan_viewer_images()
 
         return return_values
     
@@ -382,7 +380,7 @@ class RobotEnv:
     def _check_point_visibility(self):
         """Checks which points of the workplate are currently visible to the camera"""
         # load platepoints from file
-        points_np = np.loadtxt("D:/OneDrive - Venusnet/Dokumente/4. Robot V2/Alythion/0. blender/docs/grid_centers.txt")
+        points_np = self._get_workplate_grid_points()
 
         scene = bpy.context.scene
         visibility_status = []
@@ -402,6 +400,77 @@ class RobotEnv:
             visibility_status.append(is_visible)
             
         return visibility_status
+
+    def _get_workplate_grid_points(self) -> np.ndarray:
+        """Load workplate points once and reuse them for subsequent visibility checks."""
+        if self._workplate_grid_points is None:
+            if not self._workplate_grid_file.exists():
+                raise FileNotFoundError(f"Workplate grid file not found: {self._workplate_grid_file}")
+            loaded = np.loadtxt(self._workplate_grid_file)
+            self._workplate_grid_points = np.atleast_2d(loaded)
+        return self._workplate_grid_points
+
+    @staticmethod
+    def _ensure_input_link(links, source_socket, target_socket):
+        """Ensure a compositor input socket has exactly one desired upstream link."""
+        current_links = list(target_socket.links)
+        if len(current_links) == 1 and current_links[0].from_socket == source_socket:
+            return
+        for link in current_links:
+            links.remove(link)
+        links.new(source_socket, target_socket)
+
+    def _ensure_grayscale_capture_nodes(self, scene):
+        """
+        Ensure grayscale compositor nodes exist and are wired once.
+        Reusing nodes avoids per-frame node-tree rebuild overhead.
+        """
+        scene.use_nodes = True
+        tree = scene.node_tree
+        nodes = tree.nodes
+        links = tree.links
+
+        rl = nodes.get("RobotEnv_RenderLayers")
+        if rl is None or rl.bl_idname != "CompositorNodeRLayers":
+            if rl is not None:
+                nodes.remove(rl)
+            rl = nodes.new("CompositorNodeRLayers")
+            rl.name = "RobotEnv_RenderLayers"
+            rl.label = "RobotEnv_RenderLayers"
+            rl.location = (185, 285)
+
+        rgb2bw = nodes.get("RobotEnv_RGBToBW")
+        if rgb2bw is None or rgb2bw.bl_idname != "CompositorNodeRGBToBW":
+            if rgb2bw is not None:
+                nodes.remove(rgb2bw)
+            rgb2bw = nodes.new("CompositorNodeRGBToBW")
+            rgb2bw.name = "RobotEnv_RGBToBW"
+            rgb2bw.label = "RobotEnv_RGBToBW"
+            rgb2bw.location = (400, 285)
+
+        viewer = nodes.get("RobotEnv_Viewer")
+        if viewer is None or viewer.bl_idname != "CompositorNodeViewer":
+            if viewer is not None:
+                nodes.remove(viewer)
+            viewer = nodes.new("CompositorNodeViewer")
+            viewer.name = "RobotEnv_Viewer"
+            viewer.label = "RobotEnv_Viewer"
+            viewer.location = (750, 210)
+        viewer.use_alpha = False
+
+        self._ensure_input_link(links, rl.outputs["Image"], rgb2bw.inputs["Image"])
+        self._ensure_input_link(links, rgb2bw.outputs["Val"], viewer.inputs["Image"])
+        self._image_capture_nodes = {"render_layers": rl, "rgb2bw": rgb2bw, "viewer": viewer}
+        return rl, rgb2bw, viewer
+
+    @staticmethod
+    def _cleanup_orphan_viewer_images():
+        """
+        Remove stale Viewer Node images left behind by previous node recreation.
+        """
+        for image in list(bpy.data.images):
+            if image.users == 0 and image.name.startswith("Viewer Node."):
+                bpy.data.images.remove(image)
     
     def _check_for_over_rotation(self, actuator_rotations: list[float]) -> bool:
         """This functino checks wether the joint angles are within their specified bounds"""
@@ -494,9 +563,10 @@ class RobotEnv:
     def step(self, actuator_velocities: list[float] | None = None, grapper_state: bool | None = None) -> float:
         """updates the environment"""
         # set new action params
-        self.current_velocites = actuator_velocities if not None else self.current_velocites
-        grapper_moved = not grapper_state == self.grapper_state
-        self.grapper_state = grapper_state if not None else self.grapper_state
+        self.current_velocites = actuator_velocities if actuator_velocities is not None else self.current_velocites
+        next_grapper_state = self.grapper_state if grapper_state is None else bool(grapper_state)
+        grapper_moved = next_grapper_state != self.grapper_state
+        self.grapper_state = next_grapper_state
 
         # move actuators
         self.robot_objects["base"].rotation_euler.z -= radians(self.current_velocites[0] / self.fps)
@@ -508,7 +578,7 @@ class RobotEnv:
 
         # set grapper
 
-        if grapper_state:
+        if self.grapper_state:
             self.robot_objects["finger - left"].rotation_euler.z = radians(160)
             self.robot_objects["finger - right"].rotation_euler.z = radians(190)
         else:
@@ -524,6 +594,7 @@ class RobotEnv:
 # server functions
 HOST = 'localhost'
 PORT = 5055
+VERBOSE_REQUEST_LOGS = False
 
 def send_response(connection, response_data):
     """Encodes and sends a response dictionary to the client."""
@@ -580,7 +651,8 @@ class RLServerModalOperator(bpy.types.Operator):
                             # Handle request as before
                             if request["function"] == "reset":
                                 env.reset(request["args"]["cube_position"], request["args"]["robot_pose"])
-                                print(f'reset environment to cube_position={request["args"]["cube_position"]}, robot_pose={request["args"]["robot_pose"]}')
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(f'reset environment to cube_position={request["args"]["cube_position"]}, robot_pose={request["args"]["robot_pose"]}')
                             
                             if request["function"] == "get_state":
                                 result = env.get_state(
@@ -594,7 +666,8 @@ class RLServerModalOperator(bpy.types.Operator):
                                     request["args"]["image"],
                                 )
                                 send_response(self._client_conn, {"result": result})
-                                print(f'retrieved and send environment state')
+                                if VERBOSE_REQUEST_LOGS:
+                                    print('retrieved and send environment state')
                             
                             if request["function"] == "step":
                                 result = env.step(
@@ -602,29 +675,34 @@ class RLServerModalOperator(bpy.types.Operator):
                                     request["args"]["grapper_state"]
                                 )
                                 send_response(self._client_conn, {"result": result})
-                                print(f'updated env with actuator_velocities={request["args"]["actuator_velocities"]}, grapper_state={request["args"]["grapper_state"]} resulting in a cost of {result}')
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(f'updated env with actuator_velocities={request["args"]["actuator_velocities"]}, grapper_state={request["args"]["grapper_state"]} resulting in a cost of {result}')
                             
                             if request["function"] == "target_cube_in_view":
                                 result = env.target_cube_in_view()
                                 send_response(self._client_conn, {"result": result})
-                                print(f'checked if target cube is in view: {result}')
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(f'checked if target cube is in view: {result}')
 
                             if request["function"] == "target_cube_within_padding":
                                 result = env.target_cube_within_padding(request["args"].get("padding", 0.1))
                                 send_response(self._client_conn, {"result": result})
-                                print(
-                                    "checked padded cube visibility: "
-                                    f"padding={request['args'].get('padding', 0.1)} result={result}"
-                                )
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(
+                                        "checked padded cube visibility: "
+                                        f"padding={request['args'].get('padding', 0.1)} result={result}"
+                                    )
 
                             if request["function"] == "cube_visibility_labels":
                                 result = env.cube_visibility_labels()
                                 send_response(self._client_conn, {"result": result})
-                                print(f"computed cube visibility labels: {result}")
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(f"computed cube visibility labels: {result}")
 
                             if request["function"] == "set_robot_pose":
                                 env.set_robot_pose(request["args"]["actuator_rotations"])
-                                print(f'set robot pose to {request["args"]["actuator_rotations"]}')
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(f'set robot pose to {request["args"]["actuator_rotations"]}')
 
                             if request["function"] == "set_cube_pose":
                                 env.set_cube_pose(
@@ -633,11 +711,12 @@ class RLServerModalOperator(bpy.types.Operator):
                                     request["args"].get("z", 0.025),
                                     request["args"].get("yaw"),
                                 )
-                                print(
-                                    "set cube pose to "
-                                    f"x={request['args']['x']}, y={request['args']['y']}, "
-                                    f"z={request['args'].get('z', 0.025)}, yaw={request['args'].get('yaw')}"
-                                )
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(
+                                        "set cube pose to "
+                                        f"x={request['args']['x']}, y={request['args']['y']}, "
+                                        f"z={request['args'].get('z', 0.025)}, yaw={request['args'].get('yaw')}"
+                                    )
                 
                 except BlockingIOError:
                     pass  # No data yet
