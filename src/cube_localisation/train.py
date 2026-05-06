@@ -41,6 +41,9 @@ from cube_localisation.dataset import (
 from cube_localisation.model import build_localisation_model
 from cube_localisation.utils import suggest_lr
 
+BACKBONE_GROUP_NAME = "backbone"
+HEAD_GROUP_NAME = "heads"
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -70,6 +73,77 @@ class EvalSummary:
     sample_target_xy_m: np.ndarray | None = None
     sample_distance_offsets_m: np.ndarray | None = None
     sample_rotation_offsets_deg: np.ndarray | None = None
+
+
+def _get_image_encoder(model: nn.Module) -> nn.Module:
+    image_encoder = getattr(model, "image_encoder", None)
+    if image_encoder is None or not isinstance(image_encoder, nn.Module):
+        raise AttributeError("Model must expose `image_encoder` for staged backbone fine-tuning.")
+    return image_encoder
+
+
+def set_backbone_trainable(model: nn.Module, trainable: bool) -> None:
+    image_encoder = _get_image_encoder(model)
+    for parameter in image_encoder.parameters():
+        parameter.requires_grad = trainable
+
+
+def is_backbone_trainable(model: nn.Module) -> bool:
+    image_encoder = _get_image_encoder(model)
+    return any(parameter.requires_grad for parameter in image_encoder.parameters())
+
+
+def build_finetune_optimizer(
+    model: nn.Module,
+    learning_rate: float,
+    weight_decay: float,
+    backbone_lr_mult: float,
+) -> torch.optim.Optimizer:
+    if learning_rate <= 0.0:
+        raise ValueError(f"learning_rate must be > 0. Got {learning_rate}.")
+    if backbone_lr_mult <= 0.0:
+        raise ValueError(f"backbone_lr_mult must be > 0. Got {backbone_lr_mult}.")
+
+    image_encoder = _get_image_encoder(model)
+    backbone_params = list(image_encoder.parameters())
+    if not backbone_params:
+        raise RuntimeError("Backbone has no parameters.")
+
+    backbone_param_ids = {id(parameter) for parameter in backbone_params}
+    head_params = [parameter for parameter in model.parameters() if id(parameter) not in backbone_param_ids]
+    if not head_params:
+        raise RuntimeError("Found no non-backbone parameters for regression/joint heads.")
+
+    all_group_params = backbone_params + head_params
+    unique_group_param_ids = {id(parameter) for parameter in all_group_params}
+    if len(all_group_params) != len(unique_group_param_ids):
+        raise RuntimeError("Parameter groups contain duplicates.")
+    if unique_group_param_ids != {id(parameter) for parameter in model.parameters()}:
+        raise RuntimeError("Optimizer parameter groups do not cover all model parameters.")
+
+    return AdamW(
+        [
+            {
+                "name": BACKBONE_GROUP_NAME,
+                "params": backbone_params,
+                "lr": learning_rate * backbone_lr_mult,
+            },
+            {
+                "name": HEAD_GROUP_NAME,
+                "params": head_params,
+                "lr": learning_rate,
+            },
+        ],
+        weight_decay=weight_decay,
+    )
+
+
+def _lr_by_group_name(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    group_lrs: dict[str, float] = {}
+    for index, param_group in enumerate(optimizer.param_groups):
+        group_name = str(param_group.get("name", f"group_{index}"))
+        group_lrs[group_name] = float(param_group["lr"])
+    return group_lrs
 
 
 def run_epoch_train(
@@ -295,6 +369,8 @@ def main() -> None:
     USE_PRETRAINED = True
     DROPOUT = 0.1
     JOINT_HIDDEN_DIM = 64
+    FREEZE_BACKBONE_EPOCHS = 5
+    BACKBONE_LR_MULT = 0.2
 
     EPOCHS = 100
     ERROR_VIS_INTERVAL_EPOCHS = 5
@@ -438,6 +514,8 @@ def main() -> None:
         joint_mean=joint_mean,
         joint_std=joint_std,
     ).to(device)
+    if FREEZE_BACKBONE_EPOCHS > 0:
+        set_backbone_trainable(model, trainable=False)
 
     loss_fn = nn.MSELoss()
     if USE_LR_FINDER:
@@ -465,7 +543,12 @@ def main() -> None:
             LEARNING_RATE = lr_finder_result.suggested_lr
             print(f"Using suggested learning rate: {LEARNING_RATE:.6g}")
 
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer = build_finetune_optimizer(
+        model=model,
+        learning_rate=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        backbone_lr_mult=BACKBONE_LR_MULT,
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=max(EPOCHS, 1))
 
     writer = SummaryWriter(log_dir=str(tensorboard_dir))
@@ -478,6 +561,8 @@ def main() -> None:
     writer.add_scalar("split/train_size", len(split.train_indices), 0)
     writer.add_scalar("split/val_size", len(split.val_indices), 0)
     writer.add_scalar("split/test_size", len(split.test_indices), 0)
+    writer.add_scalar("finetune/freeze_backbone_epochs", FREEZE_BACKBONE_EPOCHS, 0)
+    writer.add_scalar("finetune/backbone_lr_mult", BACKBONE_LR_MULT, 0)
     writer.flush()
 
     tensorboard_url: str | None = None
@@ -508,6 +593,10 @@ def main() -> None:
     last_ckpt_path = checkpoints_dir / "last.pt"
 
     for epoch in range(1, EPOCHS + 1):
+        should_freeze_backbone = epoch <= FREEZE_BACKBONE_EPOCHS
+        set_backbone_trainable(model, trainable=not should_freeze_backbone)
+        finetune_phase = "frozen_warmup" if should_freeze_backbone else "full_finetune"
+
         train_loss = run_epoch_train(model, train_loader, loss_fn, optimizer, device)
         collect_error_samples = ERROR_VIS_INTERVAL_EPOCHS > 0 and (
             (epoch % ERROR_VIS_INTERVAL_EPOCHS == 0) or (epoch == EPOCHS)
@@ -536,7 +625,14 @@ def main() -> None:
             writer.add_scalar("val/mean_distance_offset_cm", eval_summary.mean_distance_offset_m * 100.0, epoch)
         if eval_summary.mean_rotation_offset_deg is not None:
             writer.add_scalar("val/mean_rotation_offset_deg", eval_summary.mean_rotation_offset_deg, epoch)
-        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch)
+        group_lrs = _lr_by_group_name(optimizer)
+        backbone_lr = group_lrs.get(BACKBONE_GROUP_NAME, optimizer.param_groups[0]["lr"])
+        head_lr = group_lrs.get(HEAD_GROUP_NAME, optimizer.param_groups[-1]["lr"])
+        writer.add_scalar("train/lr", head_lr, epoch)
+        writer.add_scalar("train/lr_backbone", backbone_lr, epoch)
+        writer.add_scalar("train/lr_heads", head_lr, epoch)
+        writer.add_scalar("finetune/backbone_trainable", 0.0 if should_freeze_backbone else 1.0, epoch)
+        writer.add_text("finetune/phase", finetune_phase, epoch)
         for idx, key in enumerate(TARGET_KEYS):
             writer.add_scalar(f"val/mae_{key}_m", float(val_mae_dim_m[idx]), epoch)
             writer.add_scalar(f"val/mae_{key}_cm", float(val_mae_dim_m[idx] * 100.0), epoch)
@@ -583,7 +679,10 @@ def main() -> None:
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_mae_m": best_val_mae_m,
             "backbone": BACKBONE,
+            "effective_backbone": BACKBONE,
             "use_pretrained": USE_PRETRAINED,
+            "freeze_backbone_epochs": FREEZE_BACKBONE_EPOCHS,
+            "backbone_lr_mult": BACKBONE_LR_MULT,
             "target_keys": list(TARGET_KEYS),
             "joint_input_dim": joint_input_dim,
             "joint_hidden_dim": JOINT_HIDDEN_DIM,
@@ -617,6 +716,10 @@ def main() -> None:
             f"train_loss={train_loss:.6f} "
             f"val_loss={val_loss:.6f} "
             f"val_mae_cm={val_mae_m * 100.0:.3f} "
+            f"phase={finetune_phase} "
+            f"backbone_trainable={int(is_backbone_trainable(model))} "
+            f"lr_backbone={backbone_lr:.6g} "
+            f"lr_heads={head_lr:.6g} "
             f"{distance_offset_str} "
             f"{rotation_offset_str}"
         )

@@ -29,8 +29,8 @@ This repository provides the data generation and model training scripts for:
 - Outputs: Whether a cube is visible and its approximate location
 
 **Cube Localisation Pipeline:**
-- Takes detected cube regions and refines them with a pre-trained backbone (ResNet34) + regression head
-- Outputs: Precise 3D coordinates (x, y, z) for the cube's position in space
+- Takes detected cube regions and refines them with an image-only ResNet backbone + regression head
+- Outputs: the camera-to-cube transform (translation plus roll/pitch/yaw), with cube-symmetric yaw encoded as `sin(4*yaw), cos(4*yaw)`, then left-composes it with the FK camera transform to recover the absolute cube pose
 - Trained on spatially-split datasets to ensure robustness across different workplate regions
 
 The two models work in sequence: Detection identifies the cube, then Localisation determines its exact position for the robot to grasp.

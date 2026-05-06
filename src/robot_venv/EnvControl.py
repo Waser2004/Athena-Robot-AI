@@ -67,6 +67,26 @@ class RobotEnv:
         self.robot_objects["finger - right"].rotation_euler.z = pi
         self.robot_objects["finger - left"].rotation_euler.z = pi
 
+    def _apply_grapper_pose(self):
+        """Apply the current logical gripper state to finger joints."""
+        if self.grapper_state:
+            self.robot_objects["finger - left"].rotation_euler.z = radians(160)
+            self.robot_objects["finger - right"].rotation_euler.z = radians(190)
+        else:
+            self.robot_objects["finger - left"].rotation_euler.z = radians(235)
+            self.robot_objects["finger - right"].rotation_euler.z = radians(125)
+
+    def teleport_robot_pose(self, actuator_rotations: list[float], grapper_state: bool | None = None):
+        """
+        Instantly set robot joints (no interpolation / velocity stepping).
+        Optionally set gripper state in the same teleport operation.
+        """
+        self.set_robot_pose(actuator_rotations)
+        self.current_velocites = [0, 0, 0, 0, 0, 0]
+        if grapper_state is not None:
+            self.grapper_state = bool(grapper_state)
+        self._apply_grapper_pose()
+
     def set_cube_pose(self, x: float, y: float, z: float = 0.025, yaw: float | None = None):
         """Set target cube pose on the workplate."""
         self.target_cube.rotation_euler.x = 0
@@ -577,13 +597,7 @@ class RobotEnv:
         self.robot_objects["tertiary arm - part 2"].rotation_euler.y -= radians(self.current_velocites[5] / self.fps)
 
         # set grapper
-
-        if self.grapper_state:
-            self.robot_objects["finger - left"].rotation_euler.z = radians(160)
-            self.robot_objects["finger - right"].rotation_euler.z = radians(190)
-        else:
-            self.robot_objects["finger - left"].rotation_euler.z = radians(235)
-            self.robot_objects["finger - right"].rotation_euler.z = radians(125)
+        self._apply_grapper_pose()
         
         # calculate cost
         max_velocities = [6.7, 6.7, 6.7, 9.5, 6.7, 9.5]
@@ -717,6 +731,23 @@ class RLServerModalOperator(bpy.types.Operator):
                                         f"x={request['args']['x']}, y={request['args']['y']}, "
                                         f"z={request['args'].get('z', 0.025)}, yaw={request['args'].get('yaw')}"
                                     )
+
+                            if request["function"] == "teleport_robot_pose":
+                                env.teleport_robot_pose(
+                                    request["args"]["actuator_rotations"],
+                                    request["args"].get("grapper_state"),
+                                )
+                                if VERBOSE_REQUEST_LOGS:
+                                    print(
+                                        "teleported robot pose to "
+                                        f"{request['args']['actuator_rotations']} "
+                                        f"with grapper_state={request['args'].get('grapper_state')}"
+                                    )
+                    elif header == b'':
+                        # Peer closed the socket: release it so a new client can connect.
+                        self._client_conn.close()
+                        self._client_conn = None
+                        self._client_addr = None
                 
                 except BlockingIOError:
                     pass  # No data yet

@@ -115,6 +115,22 @@ class EnvInteface:
             expect_response=False,
         )
 
+    def teleport_robot_pose(
+        self,
+        actuator_rotations: Sequence[float],
+        grapper_state: bool | None = None,
+    ) -> None:
+        """Teleport robot joints directly (no interpolation) and optionally set gripper state."""
+        rotations = self._ensure_six_values(actuator_rotations, "actuator_rotations")
+        args: dict[str, Any] = {"actuator_rotations": rotations}
+        if grapper_state is not None:
+            args["grapper_state"] = bool(grapper_state)
+        self._send_request(
+            function="teleport_robot_pose",
+            args=args,
+            expect_response=False,
+        )
+
     def set_cube_pose(
         self,
         x: float,

@@ -280,10 +280,10 @@ class CubeLocalisationInference:
 # ============================================================================
 
 # Path to the checkpoint (.pt file)
-CHECKPOINT_PATH = r"D:\OneDrive - Venusnet\Dokumente\4. Robot V2\Orpheus (RobotAI)\runs\cube_localisation\20260331-071029\checkpoints\best.pt"
+CHECKPOINT_PATH = r"D:\OneDrive - Venusnet\Dokumente\4. Robot V2\Orpheus (RobotAI)\runs\cube_localisation\20260429-154200\checkpoints\best.pt"
 
 # Path to the image for inference
-IMAGE_PATH = r"C:\Users\nicow\Downloads\s_000000__wp_0000__j0_0.350314__j1_0.000000__j2_0.820305__j3_0.911869__j4_-2.383215__j5_-1.412130__cx_0.000000__cy_0.000000__cz_0.000000__cyaw_0.000000.png"
+IMAGE_PATH = r"D:\OneDrive - Venusnet\Dokumente\4. Robot V2\Orpheus (RobotAI)\docs\Cube_Localisation_pregrab_dataset\s_000015__wp_-001__j0_0.049735__j1_1.003756__j2_-1.737044__j3_-1.535585__j4_0.639380__j5_0.782062__cx_-0.225257__cy_-0.597415__cz_0.025000__cyaw_0.573099.png"
 
 # Device: "cuda" or "cpu"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

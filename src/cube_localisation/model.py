@@ -114,25 +114,16 @@ class CubeLocalisationRegressor(nn.Module):
         return self.regressor(fused_features)
 
 
-def _build_resnet_backbone(
-    models: object,
+def _build_backbone_with_optional_pretrained(
+    *,
     backbone: str,
+    factory: Callable[..., nn.Module],
+    default_weights: object,
     pretrained: bool,
-) -> tuple[nn.Module, int]:
-    resnet_factories: dict[str, tuple[Callable[..., nn.Module], object]] = {
-        "resnet18": (models.resnet18, models.ResNet18_Weights.DEFAULT),
-        "resnet34": (models.resnet34, models.ResNet34_Weights.DEFAULT),
-        "resnet50": (models.resnet50, models.ResNet50_Weights.DEFAULT),
-    }
-
-    if backbone not in resnet_factories:
-        supported = ", ".join(sorted(list(resnet_factories.keys()) + ["efficientnet_b0"]))
-        raise ValueError(f"Unsupported backbone: {backbone}. Supported: {supported}")
-
-    factory, default_weights = resnet_factories[backbone]
+) -> nn.Module:
     weights = default_weights if pretrained else None
     try:
-        model = factory(weights=weights)
+        return factory(weights=weights)
     except Exception as exc:
         if not pretrained:
             raise
@@ -140,35 +131,82 @@ def _build_resnet_backbone(
             f"Could not load pretrained weights for {backbone} ({exc}). Falling back to random initialization.",
             stacklevel=2,
         )
-        model = factory(weights=None)
-    in_features = model.fc.in_features
-    model.fc = nn.Identity()
-    return model, in_features
+        return factory(weights=None)
 
 
-def _build_efficientnet_backbone(
+def _build_backbone(
     models: object,
+    backbone: str,
     pretrained: bool,
 ) -> tuple[nn.Module, int]:
-    weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-    try:
-        model = models.efficientnet_b0(weights=weights)
-    except Exception as exc:
-        if not pretrained:
-            raise
-        warnings.warn(
-            f"Could not load pretrained weights for efficientnet_b0 ({exc}). Falling back to random initialization.",
-            stacklevel=2,
+    if backbone in {"resnet18", "resnet34", "resnet50"}:
+        factories: dict[str, tuple[Callable[..., nn.Module], object]] = {
+            "resnet18": (models.resnet18, models.ResNet18_Weights.DEFAULT),
+            "resnet34": (models.resnet34, models.ResNet34_Weights.DEFAULT),
+            "resnet50": (models.resnet50, models.ResNet50_Weights.DEFAULT),
+        }
+        factory, default_weights = factories[backbone]
+        model = _build_backbone_with_optional_pretrained(
+            backbone=backbone,
+            factory=factory,
+            default_weights=default_weights,
+            pretrained=pretrained,
         )
-        model = models.efficientnet_b0(weights=None)
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Identity()
-    return model, in_features
+        in_features = model.fc.in_features
+        model.fc = nn.Identity()
+        return model, in_features
+
+    if backbone in {"efficientnet_b0"}:
+        factory, default_weights = (
+            models.efficientnet_b0,
+            models.EfficientNet_B0_Weights.DEFAULT,
+        )
+        model = _build_backbone_with_optional_pretrained(
+            backbone=backbone,
+            factory=factory,
+            default_weights=default_weights,
+            pretrained=pretrained,
+        )
+        in_features = model.classifier[1].in_features
+        model.classifier = nn.Identity()
+        return model, in_features
+
+    if backbone in {"convnext_tiny", "convnext_small", "convnext_base"}:
+        factories = {
+            "convnext_tiny": (models.convnext_tiny, models.ConvNeXt_Tiny_Weights.DEFAULT),
+            "convnext_small": (models.convnext_small, models.ConvNeXt_Small_Weights.DEFAULT),
+            "convnext_base": (models.convnext_base, models.ConvNeXt_Base_Weights.DEFAULT),
+        }
+        factory, default_weights = factories[backbone]
+        model = _build_backbone_with_optional_pretrained(
+            backbone=backbone,
+            factory=factory,
+            default_weights=default_weights,
+            pretrained=pretrained,
+        )
+        in_features = model.classifier[2].in_features
+        model.classifier = nn.Identity()
+        return model, in_features
+
+    supported = ", ".join(
+        sorted(
+            [
+                "convnext_base",
+                "convnext_small",
+                "convnext_tiny",
+                "efficientnet_b0",
+                "resnet18",
+                "resnet34",
+                "resnet50",
+            ]
+        )
+    )
+    raise ValueError(f"Unsupported backbone: {backbone}. Supported: {supported}")
 
 
 def build_localisation_model(
     output_dim: int = 2,
-    backbone: str = "resnet34",
+    backbone: str = "convnext_tiny",
     pretrained: bool = True,
     dropout: float = 0.1,
     joint_input_dim: int = 6,
@@ -179,8 +217,8 @@ def build_localisation_model(
     """
     Build an image+joint regression model.
 
-    `resnet34` is the default for more capacity while keeping ResNet-style
-    training behavior.
+    `convnext_tiny` is the default modern pretrained backbone for robust
+    transfer learning.
     """
     if output_dim <= 0:
         raise ValueError("output_dim must be > 0.")
@@ -194,14 +232,11 @@ def build_localisation_model(
             "Model creation requires torchvision pretrained backbones. Install with: pip install torchvision"
         ) from exc
 
-    if backbone == "efficientnet_b0":
-        image_encoder, image_feature_dim = _build_efficientnet_backbone(models=models, pretrained=pretrained)
-    else:
-        image_encoder, image_feature_dim = _build_resnet_backbone(
-            models=models,
-            backbone=backbone,
-            pretrained=pretrained,
-        )
+    image_encoder, image_feature_dim = _build_backbone(
+        models=models,
+        backbone=backbone,
+        pretrained=pretrained,
+    )
 
     return CubeLocalisationRegressor(
         image_encoder=image_encoder,
